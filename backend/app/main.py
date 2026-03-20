@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.database import init_db
 from app.api import health, decisions, rubrics, scoring, ai_skills, compare, review_queue, journal
+from app.api import import_url
 
 app = FastAPI(title="Decision Desk API", version="1.0.0")
 
@@ -25,6 +26,7 @@ app.include_router(ai_skills.router, prefix="/api")
 app.include_router(compare.router,   prefix="/api")
 app.include_router(review_queue.router, prefix="/api")
 app.include_router(journal.router,   prefix="/api")
+app.include_router(import_url.router, prefix="/api")
 
 
 @app.on_event("startup")

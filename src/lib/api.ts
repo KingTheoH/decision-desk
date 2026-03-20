@@ -77,11 +77,28 @@ export const ai = {
     api.get(`/ai/history/${decision_id}`).then(r => r.data),
 };
 
+// ── URL Import ────────────────────────────────────────────────────────────────
+
+export const importUrl = {
+  extract: (url: string) =>
+    api.post<{
+      succeeded: boolean;
+      url: string;
+      page_type: string;
+      extracted_text: string;
+      fields: Record<string, unknown>;
+      error_message?: string;
+    }>("/import/url", { url }).then(r => r.data),
+};
+
 // ── Compare ───────────────────────────────────────────────────────────────────
 
 export const compare = {
   get: (ids: string[]) =>
-    api.get<CompareResult>("/compare", { params: { ids } }).then(r => r.data),
+    api.get<CompareResult>("/compare", {
+      params: { ids },
+      paramsSerializer: { indexes: null },
+    }).then(r => r.data),
 };
 
 // ── Review Queue ──────────────────────────────────────────────────────────────
