@@ -40,21 +40,37 @@ def build_user_message(skill_name: str, decision_data: dict, extra_context: Opti
 
 
 def try_parse_json(text: str) -> Optional[Dict[str, Any]]:
-    """Try to extract JSON from LLM output. Models often wrap JSON in markdown fences."""
-    # Strip markdown fences
-    clean = re.sub(r"```(?:json)?\s*", "", text).strip().rstrip("`").strip()
-    # Try direct parse
+    """Try to extract JSON from LLM output. Models often wrap JSON in markdown fences
+    and append evaluation notes after the closing brace — raw_decode handles this cleanly."""
+    # Strip markdown fences (opening and closing)
+    clean = re.sub(r"```(?:json)?", "", text).strip().strip("`").strip()
+
+    # Try direct parse first (cleanest case)
     try:
         return json.loads(clean)
     except json.JSONDecodeError:
         pass
-    # Try to find first {...} block
+
+    # Use raw_decode: finds the first { and stops exactly at end of valid JSON,
+    # ignoring any trailing text like "**Evaluation Notes:**..."
+    start = clean.find("{")
+    if start != -1:
+        decoder = json.JSONDecoder()
+        try:
+            obj, _ = decoder.raw_decode(clean[start:])
+            if isinstance(obj, dict):
+                return obj
+        except json.JSONDecodeError:
+            pass
+
+    # Last resort: regex to find {...} block
     match = re.search(r"\{.*\}", clean, re.DOTALL)
     if match:
         try:
             return json.loads(match.group())
         except json.JSONDecodeError:
             pass
+
     return None
 
 
