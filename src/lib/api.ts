@@ -4,7 +4,8 @@ import type {
   CompareResult, ReviewQueueItem, JournalEntry,
 } from "./types";
 
-const api = axios.create({ baseURL: "/api" });
+const BASE = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
+const api = axios.create({ baseURL: `${BASE}/api` });
 
 // ── Decisions ────────────────────────────────────────────────────────────────
 
@@ -101,5 +102,5 @@ export const journal = {
 // ── Health ────────────────────────────────────────────────────────────────────
 
 export const health = {
-  check: () => axios.get("/health").then(r => r.data),
+  check: () => axios.get(`${BASE}/health`).then(r => r.data),
 };
