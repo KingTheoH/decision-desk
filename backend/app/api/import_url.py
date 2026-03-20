@@ -20,13 +20,15 @@ router = APIRouter()
 
 class ImportRequest(BaseModel):
     url: str
+    auto_evaluate: bool = True   # run decomposition skill automatically after import
 
 class ImportResult(BaseModel):
     succeeded: bool
     url: str
-    page_type: str          # "youtube" | "property" | "article" | "unknown"
-    extracted_text: str     # raw content we fed to the AI
-    fields: dict            # suggested field values to pre-fill
+    page_type: str              # "youtube" | "property" | "article" | "unknown"
+    extracted_text: str         # raw content we fed to the AI
+    fields: dict                # suggested field values to pre-fill
+    auto_evaluation: Optional[dict] = None   # decomposition skill result run on the content
     error_message: Optional[str] = None
 
 
@@ -45,57 +47,77 @@ def detect_page_type(url: str) -> str:
 
 def get_youtube_id(url: str) -> Optional[str]:
     parsed = urlparse(url)
+    # youtu.be/VIDEO_ID
     if "youtu.be" in parsed.netloc:
-        return parsed.path.lstrip("/")
+        return parsed.path.lstrip("/").split("?")[0]
+    # /shorts/VIDEO_ID
+    shorts_match = re.match(r"/shorts/([A-Za-z0-9_-]+)", parsed.path)
+    if shorts_match:
+        return shorts_match.group(1)
+    # /live/VIDEO_ID
+    live_match = re.match(r"/live/([A-Za-z0-9_-]+)", parsed.path)
+    if live_match:
+        return live_match.group(1)
+    # ?v=VIDEO_ID (standard watch URL)
     qs = parse_qs(parsed.query)
     return qs.get("v", [None])[0]
 
 
 async def fetch_youtube_metadata(url: str) -> str:
-    """Use YouTube oEmbed to get title + channel. Extract hashtags from title for richer context."""
-    oembed_url = f"https://www.youtube.com/oembed?url={url}&format=json"
+    """
+    Fetch YouTube video content: oEmbed metadata + auto-generated transcript.
+    Transcript gives the AI the actual spoken content to evaluate.
+    """
     parts = []
+    video_id = get_youtube_id(url)
 
+    # ── 1. oEmbed: title + channel ────────────────────────────────────────────
+    oembed_url = f"https://www.youtube.com/oembed?url={url}&format=json"
     try:
-        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
             r = await client.get(oembed_url)
             if r.status_code == 200:
                 data = r.json()
                 title = data.get("title", "")
                 channel = data.get("author_name", "")
-                channel_url = data.get("author_url", "")
 
-                # Strip hashtags from title for a clean title, keep them separately
                 clean_title = re.sub(r"#\w+", "", title).strip().rstrip(".")
                 hashtags = re.findall(r"#(\w+)", title)
 
                 parts.append(f"Video title: {clean_title}")
                 if channel:
                     parts.append(f"YouTube channel: {channel}")
-                if channel_url:
-                    parts.append(f"Channel URL: {channel_url}")
                 if hashtags:
-                    parts.append(f"Hashtags/topics: {', '.join(hashtags)}")
-                parts.append(f"Full title with tags: {title}")
+                    parts.append(f"Topics/tags: {', '.join(hashtags)}")
     except Exception:
         pass
 
-    # Try to get more from the page (won't always work — YouTube bot-protects most content)
-    try:
-        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True,
-                                      headers={"User-Agent": "Mozilla/5.0"}) as client:
-            r = await client.get(url)
-            if r.status_code == 200:
-                for pattern in [
-                    r'<meta\s+name=["\']description["\']\s+content=["\'](.*?)["\']',
-                    r'<meta\s+property=["\']og:description["\']\s+content=["\'](.*?)["\']',
-                ]:
-                    m = re.search(pattern, r.text, re.DOTALL)
-                    if m and len(m.group(1)) > 50:
-                        parts.append(f"Description: {m.group(1)[:1500]}")
-                        break
-    except Exception:
-        pass
+    # ── 2. Transcript: actual spoken content ──────────────────────────────────
+    if video_id:
+        try:
+            # Run sync transcript fetch in executor so we don't block the event loop
+            import asyncio
+            from youtube_transcript_api import YouTubeTranscriptApi
+            from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound
+
+            def _fetch_transcript(vid_id: str) -> str:
+                api = YouTubeTranscriptApi()
+                # Try English first, then any available language
+                try:
+                    transcript = api.fetch(vid_id, languages=["en", "en-US", "en-GB"])
+                except Exception:
+                    transcript = api.fetch(vid_id)
+                return " ".join(t.text for t in transcript)
+
+            loop = asyncio.get_event_loop()
+            transcript_text = await loop.run_in_executor(None, _fetch_transcript, video_id)
+
+            if transcript_text and len(transcript_text) > 50:
+                # Limit to ~4000 chars — enough for llama3.2's context
+                parts.append(f"\nVIDEO TRANSCRIPT:\n{transcript_text[:4000]}")
+        except Exception:
+            # Transcripts unavailable (disabled, private, etc.) — oEmbed data is still useful
+            pass
 
     return "\n".join(parts) if parts else ""
 
@@ -197,6 +219,35 @@ def _default_import_prompt() -> str:
 Extract structured fields from a web page and return a JSON object."""
 
 
+async def call_ollama_skill(skill_name: str, decision_data: dict) -> dict:
+    """Run a named skill prompt against decision data. Used for auto-evaluation on import."""
+    from pathlib import Path
+    prompts_dir = Path(__file__).parent.parent / "prompts"
+    prompt_path = prompts_dir / f"{skill_name}.txt"
+    if not prompt_path.exists():
+        return {}
+
+    import json as _json
+    system_prompt = prompt_path.read_text()
+    user_message = "DECISION DATA:\n" + _json.dumps(decision_data, indent=2, default=str)
+
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_message},
+        ],
+        "stream": False,
+        "options": {"temperature": 0.3},
+    }
+
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        r = await client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
+        r.raise_for_status()
+        raw = r.json().get("message", {}).get("content", "")
+        return try_parse_json(raw) or {"raw": raw[:1000]}
+
+
 # ── Route ─────────────────────────────────────────────────────────────────────
 
 @router.post("/import/url", response_model=ImportResult)
@@ -221,7 +272,7 @@ async def import_from_url(req: ImportRequest):
     if not content or len(content.strip()) < 50:
         raise HTTPException(422, "Could not extract enough content from this URL — the page may be paywalled, bot-protected, or the video/listing doesn't exist. Try a different URL.")
 
-    # AI extraction
+    # ── AI field extraction ───────────────────────────────────────────────────
     try:
         fields = await call_ollama_import(page_type, content, url)
     except HTTPException:
@@ -229,10 +280,28 @@ async def import_from_url(req: ImportRequest):
     except Exception as e:
         raise HTTPException(500, str(e))
 
+    # ── Auto-evaluation: run decomposition on the raw content ─────────────────
+    auto_evaluation = None
+    if req.auto_evaluate:
+        try:
+            # Build a minimal decision_data dict from extracted fields + raw content
+            decision_data = {
+                "title": fields.get("title", "Untitled"),
+                "type": fields.get("type", "Unknown"),
+                "summary": fields.get("summary", ""),
+                "source_url": url,
+                "raw_content_preview": content[:3000],
+            }
+            eval_result = await call_ollama_skill("decomposition", decision_data)
+            auto_evaluation = eval_result
+        except Exception:
+            pass  # Evaluation failure doesn't fail the import
+
     return ImportResult(
         succeeded=True,
         url=url,
         page_type=page_type,
-        extracted_text=content[:1000],  # Return a preview for debugging
+        extracted_text=content[:1500],
         fields=fields,
+        auto_evaluation=auto_evaluation,
     )

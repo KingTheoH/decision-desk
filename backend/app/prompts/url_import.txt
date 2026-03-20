@@ -71,8 +71,9 @@ RULES:
 - Only include investment_details if type is Investment
 - Only include content_details if type is ContentIdea
 - All monetary values should be in USD (convert if necessary)
-- If the page is a YouTube video, extract the decision/idea DISCUSSED in the video, not YouTube itself
+- If the content includes a VIDEO TRANSCRIPT, use it as the primary source of truth — it is the actual spoken content
+- If the page is a YouTube video, extract the decision/idea DISCUSSED in the video, not YouTube itself. A video about a property = type Property. A video about a business idea = type BusinessIdea.
 - CRITICAL: Be 100% factual. Only extract what is explicitly stated in the content. NEVER copy field descriptions or examples from the schema as values.
 - If a field cannot be determined from the content, set it to null — do NOT invent or guess values
-- If the content is too sparse to fill meaningful fields, return {"title": null, "type": null, "summary": "Insufficient content to extract decision data"} and nothing else
+- If the content is genuinely too sparse (under 30 words of real content) to fill any meaningful fields, return {"title": null, "type": null, "summary": "Insufficient content"} and nothing else
 - Return ONLY the JSON object. No preamble, no explanation, no markdown fences.

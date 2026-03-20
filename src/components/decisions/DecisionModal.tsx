@@ -41,6 +41,7 @@ export default function DecisionModal({ onClose, onSaved, existing }: Props) {
   const [importing, setImporting] = useState(false);
   const [importStatus, setImportStatus] = useState<"idle" | "success" | "error">("idle");
   const [importMsg, setImportMsg] = useState("");
+  const [autoEval, setAutoEval] = useState<Record<string, unknown> | null>(null);
   const [saving, setSaving] = useState(false);
 
   const set = (k: string, v: string) => setForm(f => ({ ...f, [k]: v }));
@@ -75,6 +76,7 @@ export default function DecisionModal({ onClose, onSaved, existing }: Props) {
         tags:                 Array.isArray(f.tags) ? f.tags.join(", ") : prev.tags,
       }));
 
+        setAutoEval(result.auto_evaluation || null);
       setImportStatus("success");
       setImportMsg(`Extracted from ${PAGE_TYPE_LABELS[result.page_type] || result.page_type} — review and edit below`);
     } catch (e: any) {
@@ -157,6 +159,42 @@ export default function DecisionModal({ onClose, onSaved, existing }: Props) {
               {importStatus === "error" && (
                 <div className="flex items-center gap-1.5 text-xs text-red-400">
                   <AlertCircle size={11} /> {importMsg}
+                </div>
+              )}
+
+              {/* Auto-evaluation result */}
+              {autoEval && (
+                <div className="mt-2 rounded-md border border-violet-500/20 bg-surface-2 p-3 space-y-2">
+                  <div className="text-xs font-medium text-violet-400 uppercase tracking-wider">AI Evaluation</div>
+                  {Object.entries(autoEval).map(([key, val]) => {
+                    if (val === null || val === undefined || val === "") return null;
+                    return (
+                      <div key={key}>
+                        <div className="text-[10px] uppercase tracking-wider text-zinc-600 mb-0.5">{key.replace(/_/g, " ")}</div>
+                        {Array.isArray(val) ? (
+                          <ul className="space-y-0.5">
+                            {(val as unknown[]).map((v, i) => (
+                              <li key={i} className="text-xs text-zinc-300 flex gap-1.5">
+                                <span className="text-violet-500 shrink-0">·</span>
+                                <span>{String(v)}</span>
+                              </li>
+                            ))}
+                          </ul>
+                        ) : typeof val === "object" ? (
+                          <div className="space-y-0.5 pl-2 border-l border-border">
+                            {Object.entries(val as Record<string, unknown>).map(([k, v]) => (
+                              <div key={k} className="flex gap-2 text-xs">
+                                <span className="text-zinc-600 shrink-0 capitalize">{k.replace(/_/g, " ")}:</span>
+                                <span className="text-zinc-300">{v === null ? "—" : String(v)}</span>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <p className="text-xs text-zinc-300">{String(val)}</p>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
               )}
             </div>
