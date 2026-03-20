@@ -29,7 +29,8 @@
 
 @layer components {
   .btn {
-    @apply inline-flex items-center gap-2 px-3 py-1.5 rounded-md text-sm font-medium transition-colors;
+    @apply inline-flex items-center gap-2 px-3 py-1.5 rounded-md text-sm font-medium transition-colors
+           disabled:opacity-40 disabled:cursor-not-allowed disabled:pointer-events-none;
   }
   .btn-primary {
     @apply bg-violet-600 hover:bg-violet-500 text-white;

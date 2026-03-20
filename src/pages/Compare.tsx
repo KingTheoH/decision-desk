@@ -10,8 +10,15 @@ export default function Compare() {
   const [selected, setSelected] = useState<string[]>([]);
   const [result, setResult] = useState<CompareResult | null>(null);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => { decisionsApi.list().then(setAll); }, []);
+  useEffect(() => {
+    decisionsApi.list().then(data => {
+      setAll(data);
+      const validIds = new Set(data.map(d => d.id));
+      setSelected(prev => prev.filter(id => validIds.has(id)));
+    });
+  }, []);
 
   function toggle(id: string) {
     setSelected(prev =>
@@ -22,9 +29,13 @@ export default function Compare() {
   async function runCompare() {
     if (selected.length < 2) return;
     setLoading(true);
+    setError(null);
+    setResult(null);
     try {
       const r = await compareApi.get(selected);
       setResult(r);
+    } catch (e: any) {
+      setError(e?.response?.data?.detail ?? "Compare failed — please try again");
     } finally {
       setLoading(false);
     }
@@ -74,8 +85,16 @@ export default function Compare() {
           onClick={runCompare}
           disabled={selected.length < 2 || loading}
         >
-          {loading ? "Comparing…" : `Compare ${selected.length} Decisions`}
+          {loading ? "Comparing…" : `Compare ${selected.length} Decision${selected.length !== 1 ? "s" : ""}`}
         </button>
+        {selected.length < 2 && selected.length > 0 && (
+          <p className="text-xs text-zinc-600 mt-2">Select at least 2 to compare</p>
+        )}
+        {error && (
+          <div className="mt-3 p-3 rounded-md bg-red-900/20 border border-red-900/40 text-red-400 text-sm">
+            {error}
+          </div>
+        )}
       </div>
 
       {/* Results */}
