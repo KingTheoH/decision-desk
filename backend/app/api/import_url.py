@@ -185,55 +185,132 @@ async def fetch_page_text(url: str, max_chars: int = 6000) -> str:
     return combined[:max_chars] if combined else "Could not extract meaningful text from this page."
 
 
+# Regional gross yield benchmarks (%) — used when AI can't calculate or gets it wrong
+_REGION_YIELDS = {
+    # Japan — central cities (high price, compressed yield)
+    "central_japan":  5.5,   # Tokyo 23 wards, Osaka central, Kyoto, Nagoya, Yokohama
+    # Japan — suburban commuter belt (1hr from major city)
+    "suburban_japan": 7.0,   # Chiba, Saitama, Kanagawa suburbs, Osaka suburbs
+    # Japan — regional cities & rural
+    "rural_japan":    8.5,   # Fukushima, Hokkaido, countryside, akiya belt
+    # Canada
+    "vancouver":      4.0,
+    "toronto":        4.5,
+    "canada":         5.0,
+    # UK
+    "london":         4.0,
+    "uk":             5.5,
+    # Europe
+    "europe":         4.5,
+    # Australia
+    "australia":      4.5,
+    # USA
+    "nyc":            4.0,
+    "usa":            6.0,
+    # Default
+    "default":        6.0,
+}
+
+def _regional_yield_target(address: str) -> float:
+    """Return the expected gross yield % for a property location."""
+    a = address.lower()
+    # Japan — must check specific cities before the generic "japan" catch-all
+    if any(k in a for k in ["shibuya", "shinjuku", "minato", "chiyoda", "23 ward", "23-ward",
+                             "central tokyo", "osaka city", "kyoto city", "nagoya", "yokohama"]):
+        return _REGION_YIELDS["central_japan"]
+    if any(k in a for k in ["chiba", "saitama", "kanagawa", "kawasaki", "sagamihara",
+                             "funabashi", "yachio", "ichikawa", "matsudo", "urayasu",
+                             "suburban tokyo", "suburban osaka"]):
+        return _REGION_YIELDS["suburban_japan"]
+    if any(k in a for k in ["japan", "tokyo", "osaka", "hokkaido", "fukushima",
+                             "akiya", "rural", "countryside", "inaka"]):
+        # Generic Japan — lean toward suburban/rural since cheap properties are rarely central
+        return _REGION_YIELDS["rural_japan"]
+    if "vancouver" in a or "bc" in a:
+        return _REGION_YIELDS["vancouver"]
+    if "toronto" in a or "ontario" in a:
+        return _REGION_YIELDS["toronto"]
+    if "canada" in a or "calgary" in a or "montreal" in a:
+        return _REGION_YIELDS["canada"]
+    if "london" in a:
+        return _REGION_YIELDS["london"]
+    if any(k in a for k in ["uk", "england", "scotland", "wales"]):
+        return _REGION_YIELDS["uk"]
+    if any(k in a for k in ["new york", "nyc", "manhattan"]):
+        return _REGION_YIELDS["nyc"]
+    if any(k in a for k in ["australia", "sydney", "melbourne"]):
+        return _REGION_YIELDS["australia"]
+    return _REGION_YIELDS["default"]
+
+
 def _sanity_check_property_financials(fields: dict) -> dict:
     """
-    Validate and correct property financial estimates.
-    llama3.2 often produces rent figures in the wrong currency or scale.
-    We detect implausible gross yields and recalculate using market benchmarks.
+    Validate and correct property financial estimates produced by the LLM.
+
+    LLMs (especially smaller ones like llama3.2) frequently:
+      - Return rent in the wrong currency (JPY instead of USD)
+      - Return null gross_yield even when they have rent + price
+      - Return a negative expected_return that overrides our calculation
+
+    Strategy: whenever asking_price is known, we always verify / recalculate
+    gross_yield from first principles and override expected_return accordingly.
     """
-    pd = fields.get("property_details")
-    if not pd or not isinstance(pd, dict):
+    pd_dict = fields.get("property_details")
+    if not pd_dict or not isinstance(pd_dict, dict):
         return fields
 
-    asking = pd.get("asking_price")
-    rent = pd.get("monthly_rent_estimate")
-    if not asking or not rent or asking <= 0:
+    asking = pd_dict.get("asking_price")
+    if not asking or float(asking) <= 0:
         return fields
 
-    # Calculate the implied gross yield
-    implied_gross = (rent * 12 / asking) * 100
+    asking = float(asking)
+    address = pd_dict.get("address") or ""
+    target_gross = _regional_yield_target(address)
 
-    # If yield > 20% the rent is almost certainly in the wrong unit or scale
-    # Use a region-appropriate benchmark yield instead
-    if implied_gross > 20:
-        address = (pd.get("address") or "").lower()
-        # Infer a reasonable gross yield target by region
-        if any(k in address for k in ["tokyo", "osaka", "kyoto", "yokohama", "nagoya"]):
-            target_gross = 5.5   # central Japan city
-        elif any(k in address for k in ["japan", "fukushima", "hokkaido", "rural", "countryside"]):
-            target_gross = 6.5   # rural/regional Japan (higher yield, lower absolute rent)
-        elif any(k in address for k in ["vancouver", "toronto", "montreal", "canada"]):
-            target_gross = 4.0
-        elif any(k in address for k in ["london", "uk", "england"]):
-            target_gross = 4.5
-        else:
-            target_gross = 5.5  # generic default
+    rent = pd_dict.get("monthly_rent_estimate")
+    gross = pd_dict.get("gross_yield_pct")
 
+    # ── Step 1: derive gross from rent if we have it but gross is missing ──────
+    if rent and float(rent) > 0 and not gross:
+        gross = (float(rent) * 12 / asking) * 100
+        pd_dict["gross_yield_pct"] = round(gross, 2)
+
+    # ── Step 2: if gross is implausible (>20% or ≤0), recalculate from target ─
+    if not gross or float(gross) <= 0 or float(gross) > 20:
         corrected_rent = round((asking * target_gross / 100) / 12)
-        corrected_gross = round((corrected_rent * 12 / asking) * 100, 2)
+        gross = round((corrected_rent * 12 / asking) * 100, 2)
+        pd_dict["monthly_rent_estimate"] = corrected_rent
+        pd_dict["gross_yield_pct"] = gross
+        note = f"[Rent estimated at ${corrected_rent}/mo ({gross:.1f}% gross yield, {address.split(',')[0].strip() or 'regional'} market benchmark)]"
+        pd_dict["demand_notes"] = ((pd_dict.get("demand_notes") or pd_dict.get("notes") or "") + " " + note).strip()
+        if "notes" in pd_dict:
+            pd_dict["notes"] = pd_dict["demand_notes"]
 
-        pd["monthly_rent_estimate"] = corrected_rent
-        pd["gross_yield_pct"] = corrected_gross
-        if not pd.get("notes"):
-            pd["notes"] = ""
-        pd["notes"] = (pd["notes"] + f" [Rent auto-corrected to ${corrected_rent}/mo, {corrected_gross}% gross yield based on regional market benchmark]").strip()
-        fields["property_details"] = pd
+    # ── Step 3: also correct rent if yield is now known but rent is still off ──
+    if gross and float(gross) > 0:
+        gross = float(gross)
+        # Back-calculate what rent should be; if AI rent implies wrong yield, fix it
+        if rent and float(rent) > 0:
+            implied = (float(rent) * 12 / asking) * 100
+            # If the AI's rent implies a wildly different yield from what gross_yield says, fix rent
+            if gross > 0 and abs(implied - gross) > 5:
+                corrected_rent = round((asking * gross / 100) / 12)
+                pd_dict["monthly_rent_estimate"] = corrected_rent
 
-    # Always recalculate expected_return from gross yield — don't trust AI's net yield figure
-    gross = pd.get("gross_yield_pct")
-    if gross and gross > 0:
-        fields["expected_return"] = round(max(gross - 2.5, 0), 1)
+    # ── Step 4: always set expected_return from validated gross yield ──────────
+    gross = float(pd_dict.get("gross_yield_pct") or 0)
+    if gross > 0:
+        # Net yield: subtract management (~10% of rent = ~gross*0.1),
+        # property tax (~0.3%/yr of assessed), maintenance (~1%), vacancy (~8%)
+        # Simplified: gross - 2.5% covers all of the above for most markets
+        net = round(max(gross - 2.5, 0.1), 1)
+        fields["expected_return"] = net
 
+    # ── Step 5: ensure capital_required mirrors asking_price ──────────────────
+    if not fields.get("capital_required"):
+        fields["capital_required"] = asking
+
+    fields["property_details"] = pd_dict
     return fields
 
 
