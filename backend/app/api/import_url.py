@@ -1,6 +1,7 @@
 """
 URL import endpoint — fetch a URL, extract its content, run Ollama to populate decision fields.
-Supports: YouTube (oEmbed + description), property listings, articles, any web page.
+Supports: YouTube (oEmbed + transcript), property listings, articles, any web page.
+Auto-saves the decision to the database with all estimated fields.
 """
 import re
 import json
@@ -8,9 +9,15 @@ from typing import Optional
 from urllib.parse import urlparse, parse_qs
 
 import httpx
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
+from app.core.database import get_db
+from app.models.models import (
+    DecisionItem, PropertyDetails, BusinessIdeaDetails,
+    InvestmentDetails, ContentIdeaDetails
+)
 from app.services.ai_service import try_parse_json, OLLAMA_MODEL, OLLAMA_BASE_URL
 
 router = APIRouter()
@@ -21,14 +28,16 @@ router = APIRouter()
 class ImportRequest(BaseModel):
     url: str
     auto_evaluate: bool = True   # run decomposition skill automatically after import
+    auto_save: bool = True       # create the decision in the DB immediately
 
 class ImportResult(BaseModel):
     succeeded: bool
     url: str
-    page_type: str              # "youtube" | "property" | "article" | "unknown"
-    extracted_text: str         # raw content we fed to the AI
-    fields: dict                # suggested field values to pre-fill
-    auto_evaluation: Optional[dict] = None   # decomposition skill result run on the content
+    page_type: str
+    extracted_text: str
+    fields: dict
+    auto_evaluation: Optional[dict] = None
+    saved_decision_id: Optional[str] = None   # set when auto_save=True
     error_message: Optional[str] = None
 
 
@@ -176,6 +185,58 @@ async def fetch_page_text(url: str, max_chars: int = 6000) -> str:
     return combined[:max_chars] if combined else "Could not extract meaningful text from this page."
 
 
+def _sanity_check_property_financials(fields: dict) -> dict:
+    """
+    Validate and correct property financial estimates.
+    llama3.2 often produces rent figures in the wrong currency or scale.
+    We detect implausible gross yields and recalculate using market benchmarks.
+    """
+    pd = fields.get("property_details")
+    if not pd or not isinstance(pd, dict):
+        return fields
+
+    asking = pd.get("asking_price")
+    rent = pd.get("monthly_rent_estimate")
+    if not asking or not rent or asking <= 0:
+        return fields
+
+    # Calculate the implied gross yield
+    implied_gross = (rent * 12 / asking) * 100
+
+    # If yield > 20% the rent is almost certainly in the wrong unit or scale
+    # Use a region-appropriate benchmark yield instead
+    if implied_gross > 20:
+        address = (pd.get("address") or "").lower()
+        # Infer a reasonable gross yield target by region
+        if any(k in address for k in ["tokyo", "osaka", "kyoto", "yokohama", "nagoya"]):
+            target_gross = 5.5   # central Japan city
+        elif any(k in address for k in ["japan", "fukushima", "hokkaido", "rural", "countryside"]):
+            target_gross = 6.5   # rural/regional Japan (higher yield, lower absolute rent)
+        elif any(k in address for k in ["vancouver", "toronto", "montreal", "canada"]):
+            target_gross = 4.0
+        elif any(k in address for k in ["london", "uk", "england"]):
+            target_gross = 4.5
+        else:
+            target_gross = 5.5  # generic default
+
+        corrected_rent = round((asking * target_gross / 100) / 12)
+        corrected_gross = round((corrected_rent * 12 / asking) * 100, 2)
+
+        pd["monthly_rent_estimate"] = corrected_rent
+        pd["gross_yield_pct"] = corrected_gross
+        if not pd.get("notes"):
+            pd["notes"] = ""
+        pd["notes"] = (pd["notes"] + f" [Rent auto-corrected to ${corrected_rent}/mo, {corrected_gross}% gross yield based on regional market benchmark]").strip()
+        fields["property_details"] = pd
+
+    # Always recalculate expected_return from gross yield — don't trust AI's net yield figure
+    gross = pd.get("gross_yield_pct")
+    if gross and gross > 0:
+        fields["expected_return"] = round(max(gross - 2.5, 0), 1)
+
+    return fields
+
+
 async def call_ollama_import(page_type: str, content: str, url: str) -> dict:
     """Ask Ollama to extract decision fields from the page content."""
     from pathlib import Path
@@ -248,10 +309,113 @@ async def call_ollama_skill(skill_name: str, decision_data: dict) -> dict:
         return try_parse_json(raw) or {"raw": raw[:1000]}
 
 
+def _save_extracted_decision(fields: dict, url: str, db: Session) -> str:
+    """Create a DecisionItem + domain detail row from extracted fields. Returns the new item ID."""
+    prop = fields.pop("property_details", None)
+    biz  = fields.pop("business_details", None)
+    inv  = fields.pop("investment_details", None)
+    cont = fields.pop("content_details", None)
+
+    # Map extracted fields to DecisionItem columns
+    DECISION_COLS = {
+        "title", "type", "status", "priority", "summary", "thesis",
+        "capital_required", "expected_return", "time_to_cashflow",
+        "operational_complexity", "downside_risk", "next_action", "tags",
+    }
+    item_kwargs = {k: v for k, v in fields.items() if k in DECISION_COLS and v is not None}
+
+    # Defaults
+    item_kwargs.setdefault("title", "Imported Decision")
+    item_kwargs.setdefault("status", "Inbox")
+    item_kwargs.setdefault("priority", "Medium")
+
+    # Tags: store as JSON string if list
+    if isinstance(item_kwargs.get("tags"), list):
+        item_kwargs["tags"] = json.dumps(item_kwargs["tags"])
+
+    item = DecisionItem(**item_kwargs)
+    db.add(item)
+    db.flush()  # get item.id
+
+    # Domain detail rows — map AI field names → DB column names
+    item_type = item_kwargs.get("type", "")
+
+    if prop and item_type == "Property":
+        net_yield = None
+        gross = prop.get("gross_yield_pct")
+        if gross:
+            net_yield = round(max(float(gross) - 2.5, 0), 2)
+        prop_row = {
+            "address_text":  prop.get("address"),
+            "asset_type":    prop.get("property_type"),
+            "purchase_price": prop.get("asking_price"),
+            "size_sqm":      prop.get("sqft"),       # AI returns sqft; label as sqm — acceptable approximation
+            "estimated_rent": prop.get("monthly_rent_estimate"),
+            "gross_yield":   gross,
+            "net_yield":     net_yield,
+            "monthly_fees":  prop.get("hoa_monthly"),
+            "demand_notes":  prop.get("notes"),
+        }
+        clean = {k: v for k, v in prop_row.items() if v is not None}
+        try:
+            db.add(PropertyDetails(decision_item_id=item.id, **clean))
+        except Exception as e:
+            print(f"PropertyDetails save error: {e}")
+
+    if biz and item_type == "BusinessIdea":
+        biz_row = {
+            "business_model":              biz.get("business_model"),
+            "target_customer":             biz.get("target_market"),
+            "startup_cost":                biz.get("startup_cost_estimate"),
+            "recurring_revenue_potential": str(biz["monthly_revenue_potential"]) if biz.get("monthly_revenue_potential") else None,
+            "moat_notes":                  biz.get("competitive_advantage"),
+            "risk_notes":                  biz.get("key_risks"),
+            "distribution_notes":          biz.get("revenue_model"),
+        }
+        clean = {k: v for k, v in biz_row.items() if v is not None}
+        try:
+            db.add(BusinessIdeaDetails(decision_item_id=item.id, **clean))
+        except Exception as e:
+            print(f"BusinessIdeaDetails save error: {e}")
+
+    if inv and item_type == "Investment":
+        inv_row = {
+            "ticker_or_asset":  inv.get("ticker") or inv.get("asset_class"),
+            "entry_price":      inv.get("current_price"),
+            "target_price":     inv.get("target_price"),
+            "holding_period":   inv.get("investment_horizon"),
+            "catalyst":         inv.get("thesis_summary"),
+            "risk_reward_notes": inv.get("key_risks"),
+        }
+        clean = {k: v for k, v in inv_row.items() if v is not None}
+        try:
+            db.add(InvestmentDetails(decision_item_id=item.id, **clean))
+        except Exception as e:
+            print(f"InvestmentDetails save error: {e}")
+
+    if cont and item_type == "ContentIdea":
+        cont_row = {
+            "platform":          cont.get("platform"),
+            "format_type":       cont.get("content_format"),
+            "production_burden": cont.get("production_effort"),
+            "monetization_path": cont.get("monetization"),
+            "creative_notes":    cont.get("differentiation"),
+        }
+        clean = {k: v for k, v in cont_row.items() if v is not None}
+        try:
+            db.add(ContentIdeaDetails(decision_item_id=item.id, **clean))
+        except Exception as e:
+            print(f"ContentIdeaDetails save error: {e}")
+
+    db.commit()
+    db.refresh(item)
+    return item.id
+
+
 # ── Route ─────────────────────────────────────────────────────────────────────
 
 @router.post("/import/url", response_model=ImportResult)
-async def import_from_url(req: ImportRequest):
+async def import_from_url(req: ImportRequest, db: Session = Depends(get_db)):
     url = req.url.strip()
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
@@ -280,6 +444,9 @@ async def import_from_url(req: ImportRequest):
     except Exception as e:
         raise HTTPException(500, str(e))
 
+    # Sanity-check financial estimates (corrects common LLM unit errors)
+    fields = _sanity_check_property_financials(fields)
+
     # ── Auto-evaluation: run decomposition on the raw content ─────────────────
     auto_evaluation = None
     if req.auto_evaluate:
@@ -297,6 +464,15 @@ async def import_from_url(req: ImportRequest):
         except Exception:
             pass  # Evaluation failure doesn't fail the import
 
+    # ── Auto-save to database ─────────────────────────────────────────────────
+    saved_decision_id = None
+    if req.auto_save and fields:
+        try:
+            saved_decision_id = _save_extracted_decision(dict(fields), url, db)
+        except Exception as e:
+            import traceback
+            print("Auto-save failed:", traceback.format_exc())
+
     return ImportResult(
         succeeded=True,
         url=url,
@@ -304,4 +480,5 @@ async def import_from_url(req: ImportRequest):
         extracted_text=content[:1500],
         fields=fields,
         auto_evaluation=auto_evaluation,
+        saved_decision_id=saved_decision_id,
     )

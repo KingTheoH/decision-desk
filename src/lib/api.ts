@@ -80,7 +80,7 @@ export const ai = {
 // ── URL Import ────────────────────────────────────────────────────────────────
 
 export const importUrl = {
-  extract: (url: string, auto_evaluate = true) =>
+  extract: (url: string, auto_evaluate = true, auto_save = true) =>
     api.post<{
       succeeded: boolean;
       url: string;
@@ -88,8 +88,9 @@ export const importUrl = {
       extracted_text: string;
       fields: Record<string, unknown>;
       auto_evaluation?: Record<string, unknown> | null;
+      saved_decision_id?: string | null;
       error_message?: string;
-    }>("/import/url", { url, auto_evaluate }).then(r => r.data),
+    }>("/import/url", { url, auto_evaluate, auto_save }).then(r => r.data),
 };
 
 // ── Compare ───────────────────────────────────────────────────────────────────

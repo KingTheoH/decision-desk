@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { X, Link2, Loader2, CheckCircle2, AlertCircle } from "lucide-react";
 import { decisions, importUrl } from "../../lib/api";
 import type { DecisionItem, DecisionType } from "../../lib/types";
@@ -21,6 +22,7 @@ const PAGE_TYPE_LABELS: Record<string, string> = {
 };
 
 export default function DecisionModal({ onClose, onSaved, existing }: Props) {
+  const navigate = useNavigate();
   const [form, setForm] = useState({
     title: existing?.title || "",
     type: (existing?.type || "Property") as DecisionType,
@@ -52,33 +54,40 @@ export default function DecisionModal({ onClose, onSaved, existing }: Props) {
     setImporting(true);
     setImportStatus("idle");
     setImportMsg("");
+    setAutoEval(null);
     try {
-      const result = await importUrl.extract(url);
+      const result = await importUrl.extract(url, true, true);
       if (!result.succeeded || !result.fields) {
         throw new Error(result.error_message || "No fields extracted");
       }
+
+      // If auto-saved, navigate directly to the decision detail page
+      if (result.saved_decision_id) {
+        onClose();
+        navigate(`/decisions/${result.saved_decision_id}`);
+        return;
+      }
+
+      // Fallback: pre-fill the form for manual save
       const f = result.fields as Record<string, any>;
-
-      // Merge extracted fields into form — only overwrite empty fields (don't clobber user edits)
       setForm(prev => ({
-        title:                f.title            || prev.title,
-        type:                 (f.type as DecisionType) || prev.type,
-        status:               prev.status,
-        priority:             prev.priority,
-        summary:              f.summary          || prev.summary,
-        thesis:               f.thesis           || prev.thesis,
-        capital_required:     f.capital_required != null ? String(f.capital_required) : prev.capital_required,
-        expected_return:      f.expected_return  != null ? String(f.expected_return)  : prev.expected_return,
-        time_to_cashflow:     f.time_to_cashflow || prev.time_to_cashflow,
+        title:                  f.title            || prev.title,
+        type:                   (f.type as DecisionType) || prev.type,
+        status:                 prev.status,
+        priority:               prev.priority,
+        summary:                f.summary          || prev.summary,
+        thesis:                 f.thesis           || prev.thesis,
+        capital_required:       f.capital_required != null ? String(f.capital_required) : prev.capital_required,
+        expected_return:        f.expected_return  != null ? String(f.expected_return)  : prev.expected_return,
+        time_to_cashflow:       f.time_to_cashflow || prev.time_to_cashflow,
         operational_complexity: f.operational_complexity || prev.operational_complexity,
-        downside_risk:        f.downside_risk    || prev.downside_risk,
-        next_action:          f.next_action      || prev.next_action,
-        tags:                 Array.isArray(f.tags) ? f.tags.join(", ") : prev.tags,
+        downside_risk:          f.downside_risk    || prev.downside_risk,
+        next_action:            f.next_action      || prev.next_action,
+        tags:                   Array.isArray(f.tags) ? f.tags.join(", ") : prev.tags,
       }));
-
-        setAutoEval(result.auto_evaluation || null);
+      setAutoEval(result.auto_evaluation || null);
       setImportStatus("success");
-      setImportMsg(`Extracted from ${PAGE_TYPE_LABELS[result.page_type] || result.page_type} — review and edit below`);
+      setImportMsg(`Extracted from ${PAGE_TYPE_LABELS[result.page_type] || result.page_type} — review and save below`);
     } catch (e: any) {
       setImportStatus("error");
       setImportMsg(e?.response?.data?.detail ?? e?.message ?? "Import failed");
@@ -146,8 +155,8 @@ export default function DecisionModal({ onClose, onSaved, existing }: Props) {
                   disabled={importing || !urlInput.trim()}
                 >
                   {importing
-                    ? <><Loader2 size={12} className="animate-spin" /> Extracting…</>
-                    : "Extract"
+                    ? <><Loader2 size={12} className="animate-spin" /> Analysing &amp; Saving…</>
+                    : "Import & Save"
                   }
                 </button>
               </div>
