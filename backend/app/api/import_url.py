@@ -103,30 +103,36 @@ async def fetch_youtube_metadata(url: str) -> str:
 
     # ── 2. Transcript: actual spoken content ──────────────────────────────────
     if video_id:
-        try:
-            # Run sync transcript fetch in executor so we don't block the event loop
-            import asyncio
+        import asyncio
+
+        def _fetch_transcript(vid_id: str) -> str:
             from youtube_transcript_api import YouTubeTranscriptApi
-            from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound
+            api = YouTubeTranscriptApi()
+            try:
+                transcript = api.fetch(vid_id, languages=["en", "en-US", "en-GB"])
+            except Exception:
+                transcript = api.fetch(vid_id)  # any available language
+            return " ".join(t.text for t in transcript)
 
-            def _fetch_transcript(vid_id: str) -> str:
-                api = YouTubeTranscriptApi()
-                # Try English first, then any available language
-                try:
-                    transcript = api.fetch(vid_id, languages=["en", "en-US", "en-GB"])
-                except Exception:
-                    transcript = api.fetch(vid_id)
-                return " ".join(t.text for t in transcript)
+        # Use get_running_loop() — get_event_loop() is deprecated in Python 3.10+
+        # and unreliable inside async coroutines
+        loop = asyncio.get_running_loop()
+        transcript_text = ""
 
-            loop = asyncio.get_event_loop()
-            transcript_text = await loop.run_in_executor(None, _fetch_transcript, video_id)
+        # Attempt transcript up to 2 times (YouTube occasionally rate-limits on first hit)
+        for attempt in range(2):
+            try:
+                transcript_text = await loop.run_in_executor(None, _fetch_transcript, video_id)
+                if transcript_text:
+                    break
+            except Exception as exc:
+                if attempt == 0:
+                    import asyncio as _a; await _a.sleep(1.5)  # brief pause before retry
+                else:
+                    print(f"Transcript unavailable for {video_id}: {exc}")
 
-            if transcript_text and len(transcript_text) > 50:
-                # Limit to ~4000 chars — enough for llama3.2's context
-                parts.append(f"\nVIDEO TRANSCRIPT:\n{transcript_text[:4000]}")
-        except Exception:
-            # Transcripts unavailable (disabled, private, etc.) — oEmbed data is still useful
-            pass
+        if transcript_text and len(transcript_text) > 50:
+            parts.append(f"\nVIDEO TRANSCRIPT:\n{transcript_text[:4000]}")
 
     return "\n".join(parts) if parts else ""
 
@@ -211,6 +217,49 @@ _REGION_YIELDS = {
     "default":        6.0,
 }
 
+def _extract_price_from_text(text: str) -> Optional[float]:
+    """
+    Regex fallback to extract asking price from raw transcript/page text.
+    Handles: $100,000 | $100k | ¥14.9M | 14.9 million yen | 14,900,000 yen
+    Returns USD value, or None if nothing found.
+    """
+    text = text.replace(",", "")  # remove commas for easier parsing
+
+    # Direct USD amounts: "$100000", "$100k", "$1.5M"
+    m = re.search(r'\$\s*(\d+(?:\.\d+)?)\s*(k|K|million|M|m)?\b', text)
+    if m:
+        val = float(m.group(1))
+        suffix = (m.group(2) or "").lower()
+        if suffix in ("k",):          val *= 1_000
+        elif suffix in ("m", "million"): val *= 1_000_000
+        if 10_000 <= val <= 50_000_000:
+            return round(val)
+
+    # Yen amounts: "14.9 million yen", "¥14.9M", "14900000 yen"
+    m = re.search(r'(?:¥|yen\s+|jpy\s*)?(\d+(?:\.\d+)?)\s*(million|M|m|万)?\s*(?:yen|円|JPY|¥)', text, re.IGNORECASE)
+    if m:
+        val = float(m.group(1))
+        suffix = (m.group(2) or "").lower()
+        if suffix in ("million", "m"):  val *= 1_000_000
+        elif suffix == "万":            val *= 10_000
+        usd = round(val / 150)
+        if 5_000 <= usd <= 20_000_000:
+            return usd
+
+    # CAD: "CAD 500,000" or "C$500000"
+    m = re.search(r'(?:CAD|C\$)\s*(\d+(?:\.\d+)?)\s*(k|K|million|M)?', text)
+    if m:
+        val = float(m.group(1))
+        suffix = (m.group(2) or "").lower()
+        if suffix == "k":           val *= 1_000
+        elif suffix in ("m", "million"): val *= 1_000_000
+        usd = round(val / 1.38)
+        if 10_000 <= usd <= 20_000_000:
+            return usd
+
+    return None
+
+
 def _regional_yield_target(address: str) -> float:
     """Return the expected gross yield % for a property location."""
     a = address.lower()
@@ -243,7 +292,7 @@ def _regional_yield_target(address: str) -> float:
     return _REGION_YIELDS["default"]
 
 
-def _sanity_check_property_financials(fields: dict) -> dict:
+def _sanity_check_property_financials(fields: dict, raw_content: str = "") -> dict:
     """
     Validate and correct property financial estimates produced by the LLM.
 
@@ -256,11 +305,29 @@ def _sanity_check_property_financials(fields: dict) -> dict:
     gross_yield from first principles and override expected_return accordingly.
     """
     pd_dict = fields.get("property_details")
+    # If AI returned null/missing property_details but type is Property, create an empty dict
+    # so we can still apply the regex price fallback and regional yield estimation
     if not pd_dict or not isinstance(pd_dict, dict):
-        return fields
+        if fields.get("type") != "Property":
+            return fields
+        pd_dict = {}
+        fields["property_details"] = pd_dict
 
     asking = pd_dict.get("asking_price")
+
+    # If AI missed the asking price, try to extract it from the raw transcript/page text
+    if (not asking or float(asking) <= 0) and raw_content:
+        fallback_price = _extract_price_from_text(raw_content)
+        if fallback_price:
+            asking = fallback_price
+            pd_dict["asking_price"] = asking
+            fields["capital_required"] = asking
+
+    # If we still have no price, apply a safety net and bail
     if not asking or float(asking) <= 0:
+        er = fields.get("expected_return")
+        if isinstance(er, (int, float)) and er < 0:
+            fields["expected_return"] = None
         return fields
 
     asking = float(asking)
@@ -522,7 +589,12 @@ async def import_from_url(req: ImportRequest, db: Session = Depends(get_db)):
         raise HTTPException(500, str(e))
 
     # Sanity-check financial estimates (corrects common LLM unit errors)
-    fields = _sanity_check_property_financials(fields)
+    fields = _sanity_check_property_financials(fields, raw_content=content)
+
+    # Final safety net: never show negative expected_return on any decision
+    er = fields.get("expected_return")
+    if isinstance(er, (int, float)) and er < 0:
+        fields["expected_return"] = None
 
     # ── Auto-evaluation: run decomposition on the raw content ─────────────────
     auto_evaluation = None
